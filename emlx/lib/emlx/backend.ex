@@ -1262,6 +1262,9 @@ defmodule EMLX.Backend do
         mode
       )
 
+    # mx::quantized_matmul promotes the activation's dtype with the scales'
+    result = EMLX.astype(result, to_mlx_type(out.type))
+
     to_nx(result, out)
   end
 

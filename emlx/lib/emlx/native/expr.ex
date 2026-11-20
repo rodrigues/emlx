@@ -2438,8 +2438,9 @@ defmodule EMLX.Native.Expr do
       | instructions: [{qmm_ref, :quantized_matmul, operands, attrs} | state.instructions]
     }
 
-    # mx::quantized_matmul returns the activation's dtype (matching the eager
-    {result_ref, state} = emit_cast_if_needed(qmm_ref, left.type, out_type, state)
+    # mx::quantized_matmul promotes the activation's dtype with the scales'
+    result_type = Nx.Type.merge(left.type, cfg.scales.type)
+    {result_ref, state} = emit_cast_if_needed(qmm_ref, result_type, out_type, state)
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
