@@ -1338,15 +1338,18 @@ defmodule EMLX do
       when not is_nil(cfg) do
     biases_ref = cfg.biases && EMLX.Backend.from_nx(cfg.biases)
 
-    EMLX.dequantize(
-      weight_ref,
-      EMLX.Backend.from_nx(cfg.scales),
-      biases_ref,
-      cfg.group_size,
-      cfg.bits,
-      cfg.mode
-    )
-    |> EMLX.Backend.to_nx()
+    dense =
+      EMLX.dequantize(
+        weight_ref,
+        EMLX.Backend.from_nx(cfg.scales),
+        biases_ref,
+        cfg.group_size,
+        cfg.bits,
+        cfg.mode
+      )
+
+    dense = if cfg.transpose, do: EMLX.transpose(dense, [1, 0]), else: dense
+    EMLX.Backend.to_nx(dense)
   end
 
   @doc """

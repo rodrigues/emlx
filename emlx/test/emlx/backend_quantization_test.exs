@@ -159,4 +159,79 @@ defmodule EMLX.BackendQuantizationTest do
       assert Nx.shape(result) == {4, 5}
     end
   end
+
+  describe "transpose" do
+    setup do
+      input = Nx.iota({1, 4, 128}, type: :f32) |> Nx.divide(100)
+      input = Nx.backend_transfer(input, {EMLX.Backend, device: :gpu})
+
+      weight = Nx.iota({64, 128}, type: :f32) |> Nx.sin()
+      weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+
+      %{input: input, qw: EMLX.quantize(weight, [])}
+    end
+
+    test "swaps the logical shape and keeps the packed data", %{qw: qw} do
+      transposed = Nx.transpose(qw)
+
+      assert Nx.shape(transposed) == {128, 64}
+      assert Nx.type(transposed) == {:s, 4}
+      assert transposed.data.ref == qw.data.ref
+      assert transposed.data.shape == qw.data.shape
+      assert transposed.data.quantization_config.transpose == true
+    end
+
+    test "transposing twice restores the original tensor", %{qw: qw} do
+      restored = qw |> Nx.transpose() |> Nx.transpose()
+
+      assert Nx.shape(restored) == Nx.shape(qw)
+      assert restored.data.quantization_config.transpose == nil
+    end
+
+    test "contracting the first axis of the transposed tensor matches the original",
+         %{input: input, qw: qw} do
+      expected = Nx.dot(input, [2], qw, [1])
+
+      assert_all_close(Nx.dot(input, [2], Nx.transpose(qw), [0]), expected)
+      assert_all_close(Nx.dot(input, Nx.transpose(qw)), expected)
+    end
+
+    test "the transposed tensor runs as a parameter of a compiled function",
+         %{input: input, qw: qw} do
+      expected = Nx.dot(input, [2], qw, [1])
+      result = Nx.Defn.jit(&Nx.dot/2, compiler: EMLX).(input, Nx.transpose(qw))
+
+      assert_all_close(result, expected)
+    end
+
+    test "dequantizing the transposed tensor transposes the dense tensor", %{qw: qw} do
+      expected = qw |> EMLX.Quantization.dequantize() |> Nx.transpose()
+      result = qw |> Nx.transpose() |> EMLX.Quantization.dequantize()
+
+      assert Nx.shape(result) == {128, 64}
+      assert_all_close(result, expected)
+    end
+
+    test "a compiled dot casts to the activation type when the scales are wider",
+         %{input: input, qw: qw} do
+      assert Nx.type(qw.data.quantization_config.scales) == {:f, 32}
+      input = Nx.as_type(input, :f16)
+
+      expected = Nx.dot(input, [2], qw, [1])
+      result = Nx.Defn.jit(&Nx.dot(&1, [2], &2, [1]), compiler: EMLX).(input, qw)
+
+      assert Nx.type(result) == {:f, 16}
+      assert_all_close(result, expected)
+    end
+
+    test "raises on axes other than [1, 0]" do
+      weight = Nx.iota({2, 64, 64}, type: :f32) |> Nx.divide(100)
+      weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+      qw = EMLX.quantize(weight, [])
+
+      assert_raise ArgumentError, ~r/only of rank 2 with axes \[1, 0\]/, fn ->
+        Nx.transpose(qw, axes: [0, 2, 1])
+      end
+    end
+  end
 end

@@ -520,6 +520,27 @@ defmodule EMLX.Backend do
   end
 
   @impl true
+  def transpose(
+        %T{} = out,
+        %T{data: %Backend{quantization_config: %EMLX.Quantization.Config{} = cfg}} = tensor,
+        [1, 0]
+      ) do
+    # Only the logical shape swaps; the flag tells quantized_matmul how to read the packed data
+    transpose =
+      case cfg.transpose do
+        nil -> true
+        true -> nil
+      end
+
+    %{out | data: %{tensor.data | quantization_config: %{cfg | transpose: transpose}}}
+  end
+
+  def transpose(_out, %T{data: %Backend{quantization_config: %EMLX.Quantization.Config{}}}, axes) do
+    raise ArgumentError,
+          "EMLX.Backend.transpose/3 supports a quantized tensor only of rank 2 with axes [1, 0], " <>
+            "got axes #{inspect(axes)}"
+  end
+
   def transpose(out, tensor, axes) do
     tensor
     |> from_nx()
