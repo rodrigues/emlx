@@ -837,6 +837,28 @@ static const std::unordered_map<std::string, OpFn> op_registry = {
                                           transpose, group_size, bits, mode, stream);
      }},
 
+    // ── gather_qmm ────────────────────────────────────────────────────────────
+    //
+    // iattrs = [group_size, bits, transpose_int, mode_int, has_bias_int]
+    // Operands: [activation, weight, scales, biases?, rhs_indices]. Each
+    // activation row is multiplied by the expert of `weight` that
+    // rhs_indices names.
+    {"gather_qmm",
+     [](const auto &ops, const auto &attrs, mlx::core::StreamOrDevice stream) {
+       int group_size = static_cast<int>(attrs[0]);
+       int bits = static_cast<int>(attrs[1]);
+       bool transpose = attrs[2] != 0;
+       std::string mode = attrs[3].as_mode();
+       bool has_bias = attrs[4] != 0;
+       std::optional<mlx::core::array> biases_opt =
+           has_bias ? std::make_optional(ops[3]) : std::nullopt;
+       const auto &rhs_indices = ops[has_bias ? 4 : 3];
+       return mlx::core::gather_qmm(ops[0], ops[1], ops[2], biases_opt, std::nullopt,
+                                    rhs_indices, transpose, group_size, bits, mode,
+                                    /*global_scale=*/std::nullopt,
+                                    /*sorted_indices=*/false, stream);
+     }},
+
     // ── indexing / selection ─────────────────────────────────────────────────
     //
     // select: operands = [pred, on_true, on_false]; no attrs.

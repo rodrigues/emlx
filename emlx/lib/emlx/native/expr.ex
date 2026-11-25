@@ -1012,14 +1012,46 @@ defmodule EMLX.Native.Expr do
               "Dequantize it first with EMLX.dequantize/1."
     end
 
-    case quantized_param_config(right, state.quant_signature, state.stable_positions) do
-      nil ->
-        expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state)
+    case gathered_quantized_param(right, state) do
+      {weight, indices, cfg} ->
+        expand_gather_quantized_dot(
+          id,
+          out_type,
+          {left, c_left, b_left},
+          {right, c_right, b_right},
+          {weight, indices, cfg},
+          state
+        )
 
-      cfg ->
-        expand_quantized_dot(id, out_type, left, c_left, b_left, right, c_right, cfg, state)
+      nil ->
+        case quantized_param_config(right, state.quant_signature, state.stable_positions) do
+          nil ->
+            expand_plain_dot(id, out_type, left, c_left, right, c_right, b_left, b_right, state)
+
+          cfg ->
+            expand_quantized_dot(id, out_type, left, c_left, b_left, right, c_right, cfg, state)
+        end
     end
   end
+
+  # Taking rows of a quantized parameter stacked on its leading axis, as
+  # mixture-of-experts layers do to pick each token's expert
+  defp gathered_quantized_param(
+         %T{
+           data: %Nx.Defn.Expr{
+             op: :block,
+             args: [%Nx.Block.Take{axis: 0}, [weight, indices], _default, _fun]
+           }
+         },
+         state
+       ) do
+    case quantized_param_config(weight, state.quant_signature, state.stable_positions) do
+      nil -> nil
+      cfg -> {weight, indices, cfg}
+    end
+  end
+
+  defp gathered_quantized_param(_tensor, _state), do: nil
 
   # ── conv ─────────────────────────────────────────────────────────────────────
 
@@ -2444,6 +2476,67 @@ defmodule EMLX.Native.Expr do
     %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
   end
 
+  # Lowers Nx.dot(x, [1], [0], Nx.take(w, indices), [c], [0]), where each
+  # row of x is multiplied by the expert of w that indices names, to
+  # mx::gather_qmm, which reads the packed experts without gathering them
+  defp expand_gather_quantized_dot(
+         id,
+         out_type,
+         {left, c_left, b_left},
+         {right, c_right, b_right},
+         {weight, indices, %EMLX.Quantization.Config{} = cfg},
+         state
+       ) do
+    {rows, _} = left.shape
+    {_, out_features, in_features} = right.shape
+
+    transpose =
+      case {c_right, cfg.transpose} do
+        {[2], nil} -> true
+        {[1], nil} -> false
+        {_, explicit} -> explicit
+      end
+
+    unless tuple_size(left.shape) == 2 and c_left == [1] and b_left == [0] and b_right == [0] and
+             tuple_size(indices.shape) == 1 and c_right in [[1], [2]] do
+      raise ArgumentError,
+            "does not yet lower op :dot of a gathered quantized operand, except as " <>
+              "Nx.dot(x, [1], [0], Nx.take(w, indices), [c], [0]) with x of rank 2"
+    end
+
+    left_ref = Map.fetch!(state.node_to_ref, left.data.id)
+    weight_ref = Map.fetch!(state.node_to_ref, weight.data.id)
+    indices_ref = Map.fetch!(state.node_to_ref, indices.data.id)
+
+    {x_ref, state} = emit_reshape_instr(left_ref, [rows, 1, in_features], state)
+    {indices_ref, state} = emit_cast_if_needed(indices_ref, indices.type, {:u, 32}, state)
+    {scales_ref, state} = emit_capture(cfg.scales, state)
+
+    {operands, has_bias, state} =
+      if cfg.biases do
+        {biases_ref, state} = emit_capture(cfg.biases, state)
+        {[x_ref, weight_ref, scales_ref, biases_ref, indices_ref], 1, state}
+      else
+        {[x_ref, weight_ref, scales_ref, indices_ref], 0, state}
+      end
+
+    mode_int = String.to_atom(cfg.mode)
+    transpose_int = if transpose, do: 1, else: 0
+    attrs = [cfg.group_size, cfg.bits, transpose_int, mode_int, has_bias]
+
+    qmm_ref = make_ref()
+
+    state = %{
+      state
+      | instructions: [{qmm_ref, :gather_qmm, operands, attrs} | state.instructions]
+    }
+
+    {reshaped_ref, state} = emit_reshape_instr(qmm_ref, [rows, out_features], state)
+    result_type = Nx.Type.merge(left.type, cfg.scales.type)
+    {result_ref, state} = emit_cast_if_needed(reshaped_ref, result_type, out_type, state)
+    %{state | node_to_ref: Map.put(state.node_to_ref, id, result_ref)}
+  end
+
   defp emit_capture(%Nx.Tensor{} = tensor, state) do
     ref = make_ref()
     {ref, %{state | captures: [{ref, tensor} | state.captures]}}
@@ -3168,6 +3261,7 @@ defmodule EMLX.Native.Expr do
           positions
           |> maybe_put_stable_position(left, stable)
           |> maybe_put_stable_position(right, stable)
+          |> maybe_put_stable_position(gathered_operand(right), stable)
 
         {positions, stable}
 
@@ -3189,6 +3283,13 @@ defmodule EMLX.Native.Expr do
         acc
     end)
   end
+
+  defp gathered_operand(%T{
+         data: %Nx.Defn.Expr{op: :block, args: [%Nx.Block.Take{axis: 0}, [tensor, _], _, _]}
+       }),
+       do: tensor
+
+  defp gathered_operand(tensor), do: tensor
 
   defp maybe_put_stable_position(positions, %T{data: %Nx.Defn.Expr{id: id}}, stable) do
     case Map.fetch(stable, id) do

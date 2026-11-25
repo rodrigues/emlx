@@ -26,6 +26,41 @@ defmodule EMLX.GatherQuantizedMatmulTest do
     |> Nx.stack()
   end
 
+  describe "Nx.dot of experts taken from a quantized tensor" do
+    defp take_dot(x, w, indices), do: Nx.dot(x, [1], [0], Nx.take(w, indices), [2], [0])
+
+    test "multiplies each row by its expert, as with the dequantized experts" do
+      qw = stacked_experts(4, 32, 128)
+      x = Nx.iota({5, 128}, type: :f32) |> Nx.divide(128)
+      indices = Nx.tensor([3, 0, 3, 1, 2])
+
+      got = Nx.Defn.jit(&take_dot/3, compiler: EMLX).(x, qw, indices)
+      expected = take_dot(x, EMLX.Quantization.dequantize(qw), indices)
+
+      assert Nx.shape(got) == {5, 32}
+      assert_all_close(got, expected, atol: 1.0e-3)
+    end
+
+    test "matches gather_quantized_matmul/4" do
+      qw = stacked_experts(4, 32, 128)
+      x = Nx.iota({4, 128}, type: :f32) |> Nx.divide(128)
+      indices = Nx.tensor([2, 2, 0, 1])
+
+      got = Nx.Defn.jit(&take_dot/3, compiler: EMLX).(x, qw, indices)
+
+      expected =
+        x
+        |> Nx.reshape({4, 1, 1, 128})
+        |> EMLX.Quantization.gather_quantized_matmul(
+          qw,
+          Nx.reshape(Nx.as_type(indices, :u32), {4, 1})
+        )
+        |> Nx.reshape({4, 32})
+
+      assert_all_close(got, expected)
+    end
+  end
+
   describe "gather_quantized_matmul/4" do
     test "matches a dense per-expert reference" do
       qw = stacked_experts(4, 32, 128)
