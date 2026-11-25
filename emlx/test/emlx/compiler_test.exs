@@ -319,6 +319,48 @@ defmodule EMLX.CompilerTest do
 
       assert Enum.uniq(results) == [[0.0, -1.0]]
     end
+
+    @tag :metal
+    test "gives the same results with the body compiled on the GPU" do
+      fun = Nx.Defn.jit(&CountDown.count_down/1, compiler: EMLX, device: :gpu)
+
+      results =
+        for _ <- 1..20 do
+          fun.(Nx.tensor([30.0, 2.0], backend: {EMLX.Backend, device: :gpu}))
+          |> Nx.to_flat_list()
+        end
+
+      assert Enum.uniq(results) == [[14.0, -14.0]]
+    end
+
+    # Freeing a program frees its loops, whose compiled bodies are erased from
+    # the same MLX cache, under a lock MLX does not let a thread take twice
+    @tag :metal
+    test "evicts programs with loops compiled on the GPU" do
+      config = Application.get_env(:emlx, EMLX.CompileCache)
+      Application.put_env(:emlx, EMLX.CompileCache, max_items: 1)
+      on_exit(fn -> Application.put_env(:emlx, EMLX.CompileCache, config || []) end)
+
+      task =
+        Task.async(fn ->
+          for n <- 1..4 do
+            input = Nx.broadcast(Nx.tensor(3.0, backend: {EMLX.Backend, device: :gpu}), {n})
+            fun = Nx.Defn.jit(&CountDown.count_down/1, compiler: EMLX, device: :gpu)
+            result = fun.(input) |> Nx.to_flat_list()
+            :erlang.garbage_collect()
+            result
+          end
+        end)
+
+      assert Task.await(task, 30_000) == [
+               [0.0],
+               [0.0, 0.0],
+               [0.0, 0.0, 0.0],
+               [0.0, 0.0, 0.0, 0.0]
+             ]
+
+      assert :ets.info(:emlx_native_dispatch_cache, :size) == 1
+    end
   end
 
   describe "__compile__/4 queue wrapping" do

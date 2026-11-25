@@ -1794,6 +1794,51 @@ static std::vector<mlx::core::array> interpret_instructions(
     const std::vector<mlx::core::array> *inputs,
     const std::vector<mlx::core::array> *carry);
 
+// ── Global compile-cache mutex
+// ────────────────────────────────────────────────
+//
+// mlx::core::detail::compile and compile_erase both mutate MLX's process-wide
+// compile cache.  compile_program runs on the worker thread; ~Expr runs on
+// whichever BEAM scheduler/GC thread drops the last resource reference.  These
+// two paths can race, corrupting the cache and causing stale graph replay (e.g.
+// a static-indexed put_slice graph replayed for a dynamic-indexed program).
+//
+// All three cache-touching calls (compile, erase, and the first compiled_fn
+// invocation that inserts the traced graph) are serialised through this mutex,
+// and so are the compiled bodies of `:while` loops.
+// Recursive, because erasing a program can destroy the `:while` loops in it,
+// whose destructors take it again.
+static std::recursive_mutex s_mlx_compile_mutex;
+
+// Compiled loop bodies to erase. A loop is usually destroyed while MLX erases
+// the program that traced it, with MLX's cache lock held, which is not
+// reentrant, so the loop's erase waits for erase_pending_loop_bodies.
+static std::vector<
+    std::pair<mlx::core::detail::CompileCacheWeakPtr, std::uintptr_t>>
+    s_pending_loop_body_erases;
+
+// Called with s_mlx_compile_mutex held, and never with MLX's cache lock held.
+static void erase_pending_loop_bodies() {
+  while (!s_pending_loop_body_erases.empty()) {
+    auto pending = std::move(s_pending_loop_body_erases);
+    s_pending_loop_body_erases.clear();
+    for (const auto &[cache, compile_id] : pending)
+      mlx::core::detail::compile_erase(cache, compile_id);
+  }
+}
+
+// Records the compile cache of the calling thread, the one a compiled function
+// just used. Called with s_mlx_compile_mutex held.
+static void remember_compile_cache(
+    std::vector<mlx::core::detail::CompileCacheWeakPtr> &caches) {
+  auto cache = mlx::core::detail::compile_cache();
+  auto current = cache.lock();
+  for (const auto &known : caches)
+    if (known.lock() == current)
+      return;
+  caches.push_back(cache);
+}
+
 // ── EMLXWhile ────────────────────────────────────────────────────────────
 //
 // Native lowering of a dynamic-trip-count `Nx.Defn.while` loop (see
@@ -1822,12 +1867,20 @@ static std::vector<mlx::core::array> interpret_instructions(
 // anything computed mid-loop outside the carry.
 class EMLXWhile : public mlx::core::Primitive {
 public:
-  EMLXWhile(mlx::core::Stream stream, SubProgram cond, SubProgram body,
-            std::shared_ptr<const std::vector<mlx::core::array>> captures,
+  EMLXWhile(mlx::core::Stream stream, mlx::core::Device body_device, SubProgram cond,
+            SubProgram body, std::shared_ptr<const std::vector<mlx::core::array>> captures,
             std::shared_ptr<const std::vector<mlx::core::array>> constants)
-      : mlx::core::Primitive(stream), cond_(std::move(cond)),
+      : mlx::core::Primitive(stream), body_device_(body_device), cond_(std::move(cond)),
         body_(std::move(body)), captures_(std::move(captures)),
         constants_(std::move(constants)) {}
+
+  ~EMLXWhile() override {
+    if (compile_id_ != 0) {
+      std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
+      for (const auto &cache : compile_caches_)
+        s_pending_loop_body_erases.emplace_back(cache, compile_id_);
+    }
+  }
 
   void eval_cpu(const std::vector<mlx::core::array> &inputs,
                 std::vector<mlx::core::array> &outputs) override {
@@ -1864,9 +1917,58 @@ private:
     return outs[0].item<bool>();
   }
 
+  // On the GPU, a body without side effects or nested loops runs through
+  // mlx::core::compile, which fuses its elementwise ops and replays the traced
+  // graph on later iterations instead of interpreting every instruction again.
+  // On the CPU, fusing builds C++ kernels with the system compiler, which takes
+  // far longer than interpreting.
+  bool compilable_body() const {
+    if (body_device_.type != mlx::core::Device::gpu)
+      return false;
+    for (const auto &instr : body_.instructions) {
+      const std::string &name = instr.op.to_string();
+      if (name == "while" || name == "plugin" || name == "runtime_call" ||
+          name == "io_call")
+        return false;
+    }
+    return true;
+  }
+
+  std::vector<mlx::core::array> run_body(const std::vector<mlx::core::array> &carry) {
+    if (!body_checked_) {
+      body_checked_ = true;
+
+      if (compilable_body()) {
+        // Distinct from the ids of programs, which count up from 1
+        static std::atomic<std::uintptr_t> next_id{std::uintptr_t{1} << 48};
+        compile_id_ = next_id.fetch_add(1, std::memory_order_relaxed);
+
+        std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array> &)> fn =
+            [instructions = body_.instructions, outputs = body_.outputs,
+             captures = captures_, constants = constants_](
+                const std::vector<mlx::core::array> &carry) {
+              return interpret_instructions(instructions, outputs, captures,
+                                            constants, /*inputs=*/nullptr, &carry);
+            };
+
+        std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
+        compiled_body_ = mlx::core::detail::compile(std::move(fn), compile_id_);
+      }
+    }
+
+    if (compiled_body_) {
+      std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
+      auto outputs = compiled_body_(carry);
+      remember_compile_cache(compile_caches_);
+      return outputs;
+    }
+
+    return interpret_instructions(body_.instructions, body_.outputs, captures_,
+                                  constants_, /*inputs=*/nullptr, &carry);
+  }
+
   void evaluate_body(std::vector<mlx::core::array> &carry) {
-    carry = interpret_instructions(body_.instructions, body_.outputs, captures_,
-                                   constants_, /*inputs=*/nullptr, &carry);
+    carry = run_body(carry);
     // Force the new carry every iteration rather than chaining lazy graphs
     // across a data-dependent number of iterations: unevaluated chaining
     // would grow the traced graph unboundedly *per eval_program call*
@@ -1889,10 +1991,16 @@ private:
     }
   }
 
+  mlx::core::Device body_device_;
   SubProgram cond_;
   SubProgram body_;
   std::shared_ptr<const std::vector<mlx::core::array>> captures_;
   std::shared_ptr<const std::vector<mlx::core::array>> constants_;
+  bool body_checked_ = false;
+  std::uintptr_t compile_id_ = 0;
+  std::function<std::vector<mlx::core::array>(const std::vector<mlx::core::array> &)>
+      compiled_body_;
+  std::vector<mlx::core::detail::CompileCacheWeakPtr> compile_caches_;
 };
 
 class EMLXRuntimeCall : public mlx::core::Primitive {
@@ -2305,9 +2413,14 @@ static std::vector<mlx::core::array> interpret_instructions(
     if (name == "while") {
       const SubProgram &cond = instr.subprograms.at(0);
       const SubProgram &body = instr.subprograms.at(1);
-      auto primitive =
-          std::make_shared<EMLXWhile>(mlx::core::default_stream(k_linalg_cpu),
-                                      cond, body, captures, constants);
+      // The loop reads its condition on the CPU, and its body runs on the
+      // worker's device
+      const mlx::core::Device body_device =
+          emlx::g_current_worker ? emlx::g_current_worker->stream().device
+                                 : mlx::core::default_device();
+      auto primitive = std::make_shared<EMLXWhile>(mlx::core::default_stream(k_linalg_cpu),
+                                                   body_device, cond, body, captures,
+                                                   constants);
 
       std::vector<mlx::core::Shape> shapes;
       std::vector<mlx::core::Dtype> dtypes;
@@ -2353,19 +2466,6 @@ static std::vector<mlx::core::array> interpret_instructions(
   return outputs;
 }
 
-// ── Global compile-cache mutex
-// ────────────────────────────────────────────────
-//
-// mlx::core::detail::compile and compile_erase both mutate MLX's process-wide
-// compile cache.  compile_program runs on the worker thread; ~Expr runs on
-// whichever BEAM scheduler/GC thread drops the last resource reference.  These
-// two paths can race, corrupting the cache and causing stale graph replay (e.g.
-// a static-indexed put_slice graph replayed for a dynamic-indexed program).
-//
-// All three cache-touching calls (compile, erase, and the first compiled_fn
-// invocation that inserts the traced graph) are serialised through this mutex.
-static std::mutex s_mlx_compile_mutex;
-
 // ── Expr destructor
 // ───────────────────────────────────────────────────────────
 //
@@ -2375,21 +2475,15 @@ static std::mutex s_mlx_compile_mutex;
 
 Expr::~Expr() {
   if (compile_id != 0) {
-    std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+    std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
     for (const auto &cache : compile_caches)
       mlx::core::detail::compile_erase(cache, compile_id);
+    erase_pending_loop_bodies();
   }
 }
 
-// Records the compile cache of the calling thread, the one that compiled_fn just
-// used. Called with s_mlx_compile_mutex held.
 static void remember_compile_cache(Expr &prog) {
-  auto cache = mlx::core::detail::compile_cache();
-  auto current = cache.lock();
-  for (const auto &known : prog.compile_caches)
-    if (known.lock() == current)
-      return;
-  prog.compile_caches.push_back(cache);
+  remember_compile_cache(prog.compile_caches);
 }
 
 // ── NIF implementations
@@ -2493,7 +2587,8 @@ fine::Term compile_program_impl(ErlNifEnv *env, Program program) {
   ptr->has_runtime_call = has_runtime_call;
   ptr->num_real_outputs = program.num_real_outputs;
   {
-    std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+    std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
+    erase_pending_loop_bodies();
     ptr->compiled_fn = mlx::core::detail::compile(std::move(fn), unique_id);
   }
 
@@ -2532,7 +2627,7 @@ ERL_NIF_TERM eval_program(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
 
     std::vector<mlx::core::array> outputs;
     {
-      std::lock_guard<std::mutex> lk(s_mlx_compile_mutex);
+      std::lock_guard<std::recursive_mutex> lk(s_mlx_compile_mutex);
       outputs = prog->compiled_fn(inputs);
       remember_compile_cache(*prog);
     }
