@@ -188,6 +188,16 @@ defmodule EMLX.BackendQuantizationTest do
       assert restored.data.quantization_config.transpose == nil
     end
 
+    test "transposes a tensor whose transpose flag is false as one without the flag",
+         %{input: input, qw: qw} do
+      config = %{qw.data.quantization_config | transpose: false}
+      qw_false = %{qw | data: %{qw.data | quantization_config: config}}
+      transposed = Nx.transpose(qw_false)
+
+      assert transposed.data.quantization_config.transpose == true
+      assert_all_close(Nx.dot(input, [2], transposed, [0]), Nx.dot(input, [2], qw, [1]))
+    end
+
     test "contracting the first axis of the transposed tensor matches the original",
          %{input: input, qw: qw} do
       expected = Nx.dot(input, [2], qw, [1])

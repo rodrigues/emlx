@@ -526,12 +526,7 @@ defmodule EMLX.Backend do
         [1, 0]
       ) do
     # Only the logical shape swaps; the flag tells quantized_matmul how to read the packed data
-    transpose =
-      case cfg.transpose do
-        nil -> true
-        true -> nil
-      end
-
+    transpose = if cfg.transpose, do: nil, else: true
     %{out | data: %{tensor.data | quantization_config: %{cfg | transpose: transpose}}}
   end
 
