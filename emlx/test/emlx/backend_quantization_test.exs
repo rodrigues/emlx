@@ -240,6 +240,23 @@ defmodule EMLX.BackendQuantizationTest do
       assert_all_close(result, expected)
     end
 
+    test "raises on contracting the last axis of a square transposed tensor" do
+      input = Nx.iota({2, 64}, type: :f32) |> Nx.divide(100)
+      input = Nx.backend_transfer(input, {EMLX.Backend, device: :gpu})
+
+      weight = Nx.iota({64, 64}, type: :f32) |> Nx.sin()
+      weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+      transposed = weight |> EMLX.quantize([]) |> Nx.transpose()
+
+      assert_raise ArgumentError, ~r/can be contracted only on its first axis/, fn ->
+        Nx.dot(input, [1], transposed, [1])
+      end
+
+      assert_raise ArgumentError, ~r/can be contracted only on its first axis/, fn ->
+        Nx.Defn.jit(&Nx.dot(&1, [1], &2, [1]), compiler: EMLX).(input, transposed)
+      end
+    end
+
     test "raises on axes other than [1, 0]" do
       weight = Nx.iota({2, 64, 64}, type: :f32) |> Nx.divide(100)
       weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})

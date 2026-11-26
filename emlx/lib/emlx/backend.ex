@@ -1253,6 +1253,14 @@ defmodule EMLX.Backend do
     weight_rank = tuple_size(qw_tensor.shape)
     last_dim = weight_rank - 1
 
+    if cfg.transpose == true and right_axes != [0] do
+      axes = inspect(right_axes)
+
+      raise ArgumentError,
+            "a quantized tensor whose transpose flag is true can be contracted only on its first axis, " <>
+              "got axes #{axes}"
+    end
+
     # If cfg.transpose was explicitly set (e.g. by QuantizeParams when weights are stored
     # in {out,in} physical layout but exposed as {in,out} to Axon), use it; otherwise
     # auto-detect from right_axes.

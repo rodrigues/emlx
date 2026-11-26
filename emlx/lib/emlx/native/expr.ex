@@ -2408,6 +2408,14 @@ defmodule EMLX.Native.Expr do
 
     last_dim = tuple_size(right.shape) - 1
 
+    if cfg.transpose == true and c_right != [0] do
+      axes = inspect(c_right)
+
+      raise ArgumentError,
+            "a quantized tensor whose transpose flag is true can be contracted only on its first axis, " <>
+              "got axes #{axes}"
+    end
+
     transpose =
       case cfg.transpose do
         nil -> c_right == [last_dim]
