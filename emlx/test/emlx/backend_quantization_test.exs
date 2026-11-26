@@ -101,6 +101,24 @@ defmodule EMLX.BackendQuantizationTest do
         Nx.dot(qw, [1], input, [0])
       end
     end
+
+    for scales_type <- [{:f, 32}, {:bf, 16}] do
+      test "a compiled dot casts to the activation type with #{inspect(scales_type)} scales" do
+        input = Nx.iota({1, 4, 128}, type: :f16) |> Nx.divide(100)
+        input = Nx.backend_transfer(input, {EMLX.Backend, device: :gpu})
+
+        weight = Nx.iota({64, 128}, type: unquote(scales_type)) |> Nx.sin()
+        weight = Nx.backend_transfer(weight, {EMLX.Backend, device: :gpu})
+        qw = EMLX.quantize(weight, [])
+        assert Nx.type(qw.data.quantization_config.scales) == unquote(scales_type)
+
+        expected = Nx.dot(input, [2], qw, [1])
+        result = Nx.Defn.jit(&Nx.dot(&1, [2], &2, [1]), compiler: EMLX).(input, qw)
+
+        assert Nx.type(result) == {:f, 16}
+        assert_all_close(result, expected)
+      end
+    end
   end
 
   describe "LoRA with quantized base weight" do
@@ -219,18 +237,6 @@ defmodule EMLX.BackendQuantizationTest do
       result = qw |> Nx.transpose() |> EMLX.Quantization.dequantize()
 
       assert Nx.shape(result) == {128, 64}
-      assert_all_close(result, expected)
-    end
-
-    test "a compiled dot casts to the activation type when the scales are wider",
-         %{input: input, qw: qw} do
-      assert Nx.type(qw.data.quantization_config.scales) == {:f, 32}
-      input = Nx.as_type(input, :f16)
-
-      expected = Nx.dot(input, [2], qw, [1])
-      result = Nx.Defn.jit(&Nx.dot(&1, [2], &2, [1]), compiler: EMLX).(input, qw)
-
-      assert Nx.type(result) == {:f, 16}
       assert_all_close(result, expected)
     end
 
